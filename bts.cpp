@@ -3,6 +3,7 @@
 #include <thread>
 #include <iostream>
 #include <chrono>
+#include <sys/resource.h>
 #include "rem_bts.h"
 
 #include "MessageManager.h"
@@ -72,9 +73,9 @@ void simply_emitting(int pid, int num_edges, int num_procs, MessageManager* msgm
     }
 }
 
-void initialization_step(int pid, int num_nodes, int num_edges, int num_procs, Edge* emit_buffer, int emit_buffer_size, MessageManager* msgmng, FILE* f){
+void initialization_step(int pid, int num_nodes, int num_edges, int num_procs, Edge* emit_buffer, int emit_buffer_size, MessageManager* msgmng, FILE* f, Splitter* splitter){
 
-    RemInit* reminit = new RemInit(num_nodes, num_procs);
+    RemInit* reminit = new RemInit(num_nodes, num_procs, splitter);
 
     size_t num_read_edges = 0;
     for(int i=0; i<num_edges;){
@@ -88,10 +89,10 @@ void initialization_step(int pid, int num_nodes, int num_edges, int num_procs, E
         }
 
         int size_to_emit = reminit->partition(emit_buffer);
-        
+
         for(int j=0; j<size_to_emit; j++){
-            int up = emit_buffer[j].u % num_procs;
-            int vp = emit_buffer[j].v % num_procs;
+            int up = splitter->get_pid_for_node(emit_buffer[j].u);
+            int vp = splitter->get_pid_for_node(emit_buffer[j].v);
 
             msgmng->emit(&emit_buffer[j], up);
             if(up != vp){
@@ -111,12 +112,28 @@ void initialization_step(int pid, int num_nodes, int num_edges, int num_procs, E
     delete reminit;
 }
 
-FILE* open_and_seek(char* input, int pid, int num_procs, long& num_edges){
+FILE* open_and_seek(char* input, int pid, int num_procs, long& num_edges, int num_slow_procs, float power_ratio) {
     FILE* f = fopen(input, "rb");
     fseek(f, 0, SEEK_END);
+
+    int num_normal_procs = num_procs - num_slow_procs;
+
     long num_total_edges = ftell(f) / sizeof(Edge);
-    long pos_start = (num_total_edges * pid / num_procs) * sizeof(Edge);
-    num_edges = (num_total_edges * (pid+1) / num_procs) - (num_total_edges * (pid) / num_procs);
+    long reduced_edges = ceil((num_total_edges) / ((num_normal_procs*power_ratio) + num_slow_procs));
+    long increased_edges = ceil(reduced_edges*power_ratio);
+
+    long edge_start, pos_start;
+    if (pid<num_normal_procs) {
+        edge_start = increased_edges*pid;
+        pos_start = edge_start * sizeof(Edge);
+        num_edges = increased_edges;
+    }
+    else {
+        edge_start = (increased_edges*num_normal_procs) + (reduced_edges*(pid-num_normal_procs));
+        pos_start = (edge_start) * sizeof(Edge);
+        num_edges = reduced_edges;
+    }
+    num_edges = ((edge_start+num_edges) < num_total_edges) ? (num_edges):(num_total_edges-edge_start);
     fseek(f, pos_start, SEEK_SET);
 
     fprintf(stderr, "(%d/%d) num_total_edges: %ld, pos_start: %ld, num_edges: %ld\n", pid, num_procs, num_total_edges, pos_start, num_edges);
@@ -138,20 +155,26 @@ int main(int argc, char** argv){
     int num_nodes = strtol(argv[2], NULL, 10);
     fprintf(stderr, "(%d/%d) num_nodes: %d\n", pid, num_procs, num_nodes);
 
-    int emit_buffer_size = (num_nodes/num_procs + 1)*2;
-    if(emit_buffer_size < read_buffer_size)
-        emit_buffer_size = read_buffer_size;
+    int num_slow_procs = 8;
+    float power_ratio = 5;
+    Splitter* splitter = new Splitter(power_ratio, num_procs, num_slow_procs);
     
-    Edge* emit_buffer = new Edge[emit_buffer_size];
     MessageManager* msgmng = new MessageManager(num_procs, dt_edge);
-    RemBTS* rembts = new RemBTS(num_nodes, pid, num_procs);
+    RemBTS* rembts = new RemBTS(num_nodes, pid, num_procs, splitter);
     size_t total_communication, total_received_size;
 
+    // int emit_buffer_size = (rembts->p.num_local_nodes)*2; //Amogh: ToDo
+    int emit_buffer_size = ceil(num_nodes/(splitter->mod))*power_ratio;
+    if(emit_buffer_size < read_buffer_size)
+        emit_buffer_size = read_buffer_size;
+    Edge* emit_buffer = new Edge[emit_buffer_size];
+
     long num_edges;
-    FILE* f = open_and_seek(input, pid, num_procs, num_edges);
+
+    FILE* f = open_and_seek(input, pid, num_procs, num_edges, num_slow_procs, power_ratio);
     thread recv_thread(receiver, num_procs, msgmng, rembts, &total_received_size);
     // simply_emitting(pid, num_edges, num_procs, msgmng, f);
-    initialization_step(pid, num_nodes, num_edges, num_procs, emit_buffer, emit_buffer_size, msgmng, f);
+    initialization_step(pid, num_nodes, num_edges, num_procs, emit_buffer, emit_buffer_size, msgmng, f, splitter);
     fclose(f);
 
     milliseconds elapsed_ms = duration_cast<milliseconds>(high_resolution_clock::now()-start);
@@ -159,7 +182,12 @@ int main(int argc, char** argv){
     fprintf(stderr, "(Intialize, pid %d) recv %ld, %ld ms.\n", pid, total_received_size, elapsed_ms.count());
 
     MPI_Allreduce(&total_received_size, &total_communication, 1, MPI_UNSIGNED_LONG, MPI_SUM, MPI_COMM_WORLD);
-    
+
+    struct rlimit limit1;
+    limit1.rlim_cur = RLIM_INFINITY;
+    limit1.rlim_max = RLIM_INFINITY;
+    setrlimit(RLIMIT_CORE, &limit1);
+
     int round = 1;
     size_t num_changes = 1;
     size_t num_total_changes = 1;
@@ -176,8 +204,9 @@ int main(int argc, char** argv){
         thread recv_thread(receiver, num_procs, msgmng, rembts, &total_received_size);
 
         for(int j=0; j<toemit_size; j++){
-            int up = emit_buffer[j].u % num_procs;
-            int vp = emit_buffer[j].v % num_procs;
+            int up = splitter->get_pid_for_node(emit_buffer[j].u);
+            int vp = splitter->get_pid_for_node(emit_buffer[j].v);
+
             if(up != pid){
                 msgmng->emit(&emit_buffer[j], up);
             }

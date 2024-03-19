@@ -47,8 +47,9 @@ namespace bts{
         public:
         int num_nodes, num_parts;
         hash_t p;
+        Splitter* splitter;
 
-        RemInit(int num_nodes, int num_parts): num_nodes(num_nodes), num_parts(num_parts){
+        RemInit(int num_nodes, int num_parts, Splitter* splitter): num_nodes(num_nodes), num_parts(num_parts), splitter(splitter){
         }
         ~RemInit(){
             p.clear();
@@ -100,14 +101,15 @@ namespace bts{
             for(int i = 0, j = 0; i < size;){
                 memset(heads, -1, sizeof(int) * num_parts);
                 int cc = edges_tmp[i].v;
-                heads[cc % num_parts] = cc;
+                int cc_pid = splitter->get_pid_for_node(cc);
+                heads[cc_pid] = cc;
                 for(; j < size && edges_tmp[j].v == cc; j++){
-                    int jp = edges_tmp[j].u % num_parts;
+                    int jp = splitter->get_pid_for_node(edges_tmp[j].u);
                     if(heads[jp] > edges_tmp[j].u || heads[jp] == -1) heads[jp] = edges_tmp[j].u;
                 }
 
                 for(; i < j; i++){
-                    int ip = edges_tmp[i].u % num_parts;
+                    int ip = splitter->get_pid_for_node(edges_tmp[i].u);
                     if(heads[ip] != edges_tmp[i].u)
                         edges_tmp[i].v = heads[ip];
                 }
@@ -128,8 +130,9 @@ namespace bts{
         public:
         HybridMap p;
         int num_procs;
+        Splitter* splitter;
 
-        RemBTS(int num_nodes, int pid, int num_procs): p(num_nodes, pid, num_procs), num_procs(num_procs){}
+        RemBTS(int num_nodes, int pid, int num_procs, Splitter* splitter): p(num_nodes, pid, num_procs, splitter), num_procs(num_procs), splitter(splitter){}
 
         // assume u > v
         void merge(int u, int v){
@@ -189,14 +192,15 @@ namespace bts{
             for(int i = 0, j = 0; i < size;){
                 memset(heads, -1, sizeof(int) * num_procs);
                 int cc = toemit[i].v;
-                heads[cc % num_procs] = cc;
+                int cc_pid = splitter->get_pid_for_node(cc);
+                heads[cc_pid] = cc;
                 for(; j < size && toemit[j].v == cc; ++j){
-                    int jp = toemit[j].u % num_procs;
+                    int jp = splitter->get_pid_for_node(toemit[j].u);
                     if(heads[jp] > toemit[j].u || heads[jp] == -1) heads[jp] = toemit[j].u;
                 }
 
                 for(; i < j; ++i){
-                    int ip = toemit[i].u % num_procs;
+                    int ip = splitter->get_pid_for_node(toemit[i].u);
                     if(heads[ip] != toemit[i].u)
                         toemit[i].v = heads[ip];
                 }
@@ -208,22 +212,49 @@ namespace bts{
             int up;
             ska::flat_hash_map<int, int> ucc;
 
-            for(int i=0, u=p.pid; u < p.num_nodes; i++, u += p.num_procs){
-                up = find(u);
+            if (p.pid<p.num_normal_procs) {
+                int i = 0, power_iter_count = 0, power_ratio_iter=0;
+                while (i<p.num_local_nodes) {
+                    u = p.mod*power_iter_count + p.pid*p.power_ratio + power_ratio_iter;
+                    i++;
+                    power_ratio_iter = (power_ratio_iter+1)%int(p.power_ratio);
+                    if (power_ratio_iter==0) {
+                        power_iter_count++;
+                    }
 
-                if(up % p.num_procs == p.pid) continue;
-
-                auto it = ucc.find(up);
-                if(it == ucc.end()){
-                    ucc[up] = u;
-                    toemit[size++] = Edge{u, up};
-                    if(p[u] < 0){
-                        p[u] = up;
-                        num_changes++;
+                    up = find(u);
+                    if(splitter->get_pid_for_node(up) == p.pid) continue;
+                    auto it = ucc.find(up);
+                    if(it == ucc.end()){
+                        ucc[up] = u;
+                        toemit[size++] = Edge{u, up};
+                        if(p[u] < 0){
+                            p[u] = up;
+                            num_changes++;
+                        }
+                    }
+                    else{
+                        p[u] = it->second;
                     }
                 }
-                else{
-                    p[u] = it->second;
+            }
+            else {
+                for(int i=0; i<p.num_local_nodes; i++){
+                    u = i*p.mod + p.num_normal_procs*p.power_ratio + (p.pid-p.num_normal_procs);
+                    up = find(u);
+                    if(splitter->get_pid_for_node(up) == p.pid) continue;
+                    auto it = ucc.find(up);
+                    if(it == ucc.end()){
+                        ucc[up] = u;
+                        toemit[size++] = Edge{u, up};
+                        if(p[u] < 0){
+                            p[u] = up;
+                            num_changes++;
+                        }
+                    }
+                    else{
+                        p[u] = it->second;
+                    }
                 }
             }
 
